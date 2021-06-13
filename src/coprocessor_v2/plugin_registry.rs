@@ -1,15 +1,15 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use coprocessor_plugin_api::{allocator::HostAllocatorPtr, *};
+use coprocessor_plugin_api::{allocator::HostAllocatorPtr, util::*, *};
 use libloading::{Error as DylibError, Library, Symbol};
 use notify::{DebouncedEvent, RecursiveMode, Watcher};
 use semver::Version;
-use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, RwLock};
 use std::thread;
 use std::time::Duration;
+use std::{collections::HashMap, ops::Range};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -105,6 +105,9 @@ impl PluginRegistry {
         plugin_directory: impl Into<PathBuf>,
     ) -> notify::Result<()> {
         let plugin_directory = plugin_directory.into();
+
+        // Create plugin directory if it doesn't exist.
+        std::fs::create_dir_all(&plugin_directory)?;
 
         // If this is the first call to `start_hot_reloading()`, create a new file system watcher
         // and background thread for loading plugins. For later invocations, the same watcher and
@@ -419,12 +422,12 @@ impl LoadedPlugin {
 impl CoprocessorPlugin for LoadedPlugin {
     fn on_raw_coprocessor_request(
         &self,
-        region: &Region,
-        request: &RawRequest,
+        ranges: Vec<Range<Key>>,
+        request: RawRequest,
         storage: &dyn RawStorage,
-    ) -> Result<RawResponse, PluginError> {
+    ) -> PluginResult<RawResponse> {
         self.plugin
-            .on_raw_coprocessor_request(region, request, storage)
+            .on_raw_coprocessor_request(ranges, request, storage)
     }
 }
 
@@ -446,18 +449,15 @@ fn is_library_file<P: AsRef<Path>>(path: P) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coprocessor_plugin_api::pkgname_to_libname;
-    use std::sync::Once;
-
-    static INIT: Once = Once::new();
-    static EXAMPLE_PLUGIN: &[u8] = include_bytes!(env!("CARGO_DYLIB_FILE_EXAMPLE_PLUGIN"));
+    use coprocessor_plugin_api::util::pkgname_to_libname;
 
     fn initialize_library() -> PathBuf {
-        let lib_path = std::env::temp_dir().join(&pkgname_to_libname("example-plugin"));
-        INIT.call_once(|| {
-            std::fs::write(&lib_path, EXAMPLE_PLUGIN).unwrap();
-        });
-        lib_path
+        Path::new(if cfg!(debug_assertions) {
+            "target/debug/deps"
+        } else {
+            "target/release/deps"
+        })
+        .join(pkgname_to_libname("example-plugin"))
     }
 
     #[test]
@@ -537,10 +537,9 @@ mod tests {
         let library_path_2 = coprocessor_dir.join(pkgname_to_libname("example-plugin-2"));
         let plugin_name = "example_plugin";
 
-        // Make sure we have an existing, but empty coprocessor directory.
+        // Make the coprocessor directory is empty.
         std::fs::create_dir_all(&coprocessor_dir).unwrap();
         std::fs::remove_dir_all(&coprocessor_dir).unwrap();
-        std::fs::create_dir_all(&coprocessor_dir).unwrap();
 
         let mut registry = PluginRegistry::new();
         registry.start_hot_reloading(&coprocessor_dir).unwrap();

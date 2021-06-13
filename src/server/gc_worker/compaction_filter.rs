@@ -18,6 +18,7 @@ use engine_rocks::{
 use engine_traits::{
     KvEngine, MiscExt, Mutable, MvccProperties, WriteBatch, WriteBatchExt, WriteOptions,
 };
+use file_system::{IOType, WithIOType};
 use pd_client::{Feature, FeatureGate};
 use prometheus::{local::*, *};
 use raftstore::coprocessor::RegionInfoProvider;
@@ -417,6 +418,7 @@ impl WriteCompactionFilter {
             wb: &RocksWriteBatch,
             wopts: &WriteOptions,
         ) -> Result<(), engine_traits::Error> {
+            let _io_type_guard = WithIOType::new(IOType::Gc);
             fail_point!("write_compaction_filter_flush_write_batch", true, |_| {
                 Err(engine_traits::Error::Engine(
                     "Ingested fail point".to_string(),
@@ -462,11 +464,11 @@ impl WriteCompactionFilter {
     }
 
     fn flush_metrics(&self) {
-        GC_COMPACTION_FILTERED.inc_by(self.total_filtered as i64);
-        GC_COMPACTION_MVCC_ROLLBACK.inc_by(self.mvcc_rollback_and_locks as i64);
+        GC_COMPACTION_FILTERED.inc_by(self.total_filtered as u64);
+        GC_COMPACTION_MVCC_ROLLBACK.inc_by(self.mvcc_rollback_and_locks as u64);
         GC_COMPACTION_FILTER_ORPHAN_VERSIONS
             .with_label_values(&["generated"])
-            .inc_by(self.orphan_versions as i64);
+            .inc_by(self.orphan_versions as u64);
         if let Some((versions, filtered)) = STATS.with(|stats| {
             stats.versions.update(|x| x + self.total_versions);
             stats.filtered.update(|x| x + self.total_filtered);

@@ -1,23 +1,21 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
-use std::marker::Unpin;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use futures::executor::ThreadPool;
-use futures_util::io::{AsyncRead, AsyncReadExt};
 use kvproto::backup::StorageBackend;
 #[cfg(feature = "prost-codec")]
 use kvproto::import_sstpb::pair::Op as PairOp;
 #[cfg(not(feature = "prost-codec"))]
 use kvproto::import_sstpb::PairOp;
 use kvproto::import_sstpb::*;
-use tokio::time::timeout;
 use uuid::{Builder as UuidBuilder, Uuid};
 
 use encryption::{DataKeyManager, EncrypterWriter};
@@ -29,9 +27,7 @@ use engine_traits::{
     EncryptionKeyManager, IngestExternalFileOptions, Iterator, KvEngine, SSTMetaInfo, SeekKey,
     SstReader, SstWriter, SstWriterBuilder, CF_DEFAULT, CF_WRITE,
 };
-use external_storage::{create_storage, url_of_backend};
-use file_system::{sync_dir, File, OpenOptions};
-use tikv_util::stream::{block_on_external_io, READ_BUF_SIZE};
+use file_system::{get_io_rate_limiter, sync_dir, File, OpenOptions};
 use tikv_util::time::Limiter;
 use txn_types::{is_short_value, Key, TimeStamp, Write as KvWrite, WriteRef, WriteType};
 
@@ -61,13 +57,8 @@ impl SSTImporter {
         })
     }
 
-    pub fn start_switch_mode_check<E: KvEngine>(
-        &self,
-        executor: &ThreadPool,
-        db: E,
-        cb: Box<dyn Fn() + Send>,
-    ) {
-        self.switcher.start(executor, db, cb);
+    pub fn start_switch_mode_check<E: KvEngine>(&self, executor: &ThreadPool, db: E) {
+        self.switcher.start(executor, db);
     }
 
     pub fn get_path(&self, meta: &SstMeta) -> PathBuf {
@@ -101,14 +92,18 @@ impl SSTImporter {
         }
     }
 
-    pub fn ingest<E: KvEngine>(&self, meta: &SstMeta, engine: &E) -> Result<SSTMetaInfo> {
-        match self.dir.ingest(meta, engine, self.key_manager.clone()) {
-            Ok(meta_info) => {
-                info!("ingest"; "meta" => ?meta_info);
-                Ok(meta_info)
+    pub fn validate(&self, meta: &SstMeta) -> Result<SSTMetaInfo> {
+        self.dir.validate(meta, self.key_manager.clone())
+    }
+
+    pub fn ingest<E: KvEngine>(&self, metas: &[SstMeta], engine: &E) -> Result<()> {
+        match self.dir.ingest(metas, engine, self.key_manager.clone()) {
+            Ok(..) => {
+                info!("ingest"; "metas" => ?metas);
+                Ok(())
             }
             Err(e) => {
-                error!(%e; "ingest failed"; "meta" => ?meta, );
+                error!(%e; "ingest failed"; "metas" => ?metas, );
                 Err(e)
             }
         }
@@ -174,48 +169,6 @@ impl SSTImporter {
         self.switcher.get_mode()
     }
 
-    async fn read_external_storage_into_file(
-        input: &mut (dyn AsyncRead + Unpin),
-        output: &mut dyn Write,
-        speed_limiter: &Limiter,
-        expected_length: u64,
-        min_read_speed: usize,
-    ) -> io::Result<()> {
-        let dur = Duration::from_secs((READ_BUF_SIZE / min_read_speed) as u64);
-
-        // do the I/O copy from external_storage to the local file.
-        let mut buffer = vec![0u8; READ_BUF_SIZE];
-        let mut file_length = 0;
-
-        loop {
-            // separate the speed limiting from actual reading so it won't
-            // affect the timeout calculation.
-            let bytes_read = timeout(dur, input.read(&mut buffer))
-                .await
-                .map_err(|_| io::ErrorKind::TimedOut)??;
-            if bytes_read == 0 {
-                break;
-            }
-            speed_limiter.consume(bytes_read).await;
-            output.write_all(&buffer[..bytes_read])?;
-            file_length += bytes_read as u64;
-        }
-
-        if expected_length != 0 && expected_length != file_length {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "downloaded size {}, expected {}",
-                    file_length, expected_length
-                ),
-            ));
-        }
-
-        IMPORTER_DOWNLOAD_BYTES.observe(file_length as _);
-
-        Ok(())
-    }
-
     fn do_download<E: KvEngine>(
         &self,
         meta: &SstMeta,
@@ -226,39 +179,28 @@ impl SSTImporter {
         mut sst_writer: E::SstWriter,
     ) -> Result<Option<Range>> {
         let path = self.dir.join(meta)?;
-        let url = url_of_backend(backend);
 
-        {
+        let url = {
             let start_read = Instant::now();
 
             // prepare to download the file from the external_storage
-            let ext_storage = create_storage(backend)?;
-            let mut ext_reader = ext_storage.read(name);
+            let ext_storage = external_storage_export::create_storage(backend)?;
+            let url = ext_storage.url()?.to_string();
 
-            let mut plain_file;
-            let mut encrypted_file;
-            let file_writer: &mut dyn Write = if let Some(key_manager) = &self.key_manager {
-                encrypted_file = key_manager.create_file(&path.temp)?;
-                &mut encrypted_file
-            } else {
-                plain_file = File::create(&path.temp)?;
-                &mut plain_file
-            };
+            let ext_storage: Box<dyn external_storage_export::ExternalStorage> =
+                if let Some(key_manager) = &self.key_manager {
+                    Box::new(external_storage_export::EncryptedExternalStorage {
+                        key_manager: (*key_manager).clone(),
+                        storage: ext_storage,
+                    }) as _
+                } else {
+                    ext_storage as _
+                };
 
-            // the minimum speed of reading data, in bytes/second.
-            // if reading speed is slower than this rate, we will stop with
-            // a "TimedOut" error.
-            // (at 8 KB/s for a 2 MB buffer, this means we timeout after 4m16s.)
-            const MINIMUM_READ_SPEED: usize = 8192;
-
-            block_on_external_io(Self::read_external_storage_into_file(
-                &mut ext_reader,
-                file_writer,
-                &speed_limiter,
-                meta.length,
-                MINIMUM_READ_SPEED,
-            ))
-            .map_err(|e| Error::CannotReadExternalStorage {
+            let result =
+                ext_storage.restore(name, path.temp.to_owned(), meta.length, &speed_limiter);
+            IMPORTER_DOWNLOAD_BYTES.observe(meta.length as _);
+            result.map_err(|e| Error::CannotReadExternalStorage {
                 url: url.to_string(),
                 name: name.to_owned(),
                 local_path: path.temp.to_owned(),
@@ -273,12 +215,14 @@ impl SSTImporter {
             IMPORTER_DOWNLOAD_DURATION
                 .with_label_values(&["read"])
                 .observe(start_read.elapsed().as_secs_f64());
-        }
+
+            url
+        };
 
         // now validate the SST file.
         let path_str = path.temp.to_str().unwrap();
         let env = get_encrypted_env(self.key_manager.clone(), None /*base_env*/)?;
-        let env = get_inspected_env(Some(env))?;
+        let env = get_inspected_env(Some(env), get_io_rate_limiter())?;
         // Use abstracted SstReader after Env is abstracted.
         let sst_reader = RocksSstReader::open_with_env(path_str, Some(env))?;
         sst_reader.verify_checksum()?;
@@ -683,40 +627,53 @@ impl ImportDir {
         Ok(path.save.exists())
     }
 
-    fn ingest<E: KvEngine>(
+    fn validate(
         &self,
         meta: &SstMeta,
-        engine: &E,
         key_manager: Option<Arc<DataKeyManager>>,
     ) -> Result<SSTMetaInfo> {
-        let start = Instant::now();
         let path = self.join(meta)?;
-        let cf = meta.get_cf_name();
-
-        // now validate the SST file.
         let path_str = path.save.to_str().unwrap();
-        let env = get_encrypted_env(key_manager.clone(), None /*base_env*/)?;
-        let env = get_inspected_env(Some(env))?;
-
+        let env = get_encrypted_env(key_manager, None /*base_env*/)?;
+        let env = get_inspected_env(Some(env), get_io_rate_limiter())?;
         let sst_reader = RocksSstReader::open_with_env(&path_str, Some(env))?;
         sst_reader.verify_checksum()?;
+        // TODO: check the length and crc32 of ingested file.
         let meta_info = sst_reader.sst_meta_info(meta.to_owned());
+        Ok(meta_info)
+    }
 
-        super::prepare_sst_for_ingestion(&path.save, &path.clone, key_manager.as_deref())?;
-        let length = meta.get_length();
+    fn ingest<E: KvEngine>(
+        &self,
+        metas: &[SstMeta],
+        engine: &E,
+        key_manager: Option<Arc<DataKeyManager>>,
+    ) -> Result<()> {
+        let start = Instant::now();
 
-        // TODO check the length and crc32 of ingested file.
-        engine.reset_global_seq(cf, &path.clone)?;
-        IMPORTER_INGEST_BYTES.observe(length as _);
+        let mut paths = HashMap::new();
+        let mut ingest_bytes = 0;
+        for meta in metas {
+            let path = self.join(meta)?;
+            let cf = meta.get_cf_name();
+            super::prepare_sst_for_ingestion(&path.save, &path.clone, key_manager.as_deref())?;
+            ingest_bytes += meta.get_length();
+            engine.reset_global_seq(cf, &path.clone)?;
+            paths.entry(cf).or_insert_with(Vec::new).push(path);
+        }
 
         let mut opts = E::IngestExternalFileOptions::new();
         opts.move_files(true);
-        engine.ingest_external_file_cf(cf, &opts, &[path.clone.to_str().unwrap()])?;
-
+        for (cf, cf_paths) in paths {
+            let files: Vec<&str> = cf_paths.iter().map(|p| p.clone.to_str().unwrap()).collect();
+            engine.ingest_external_file_cf(cf, &opts, &files)?;
+        }
+        INPORTER_INGEST_COUNT.observe(metas.len() as _);
+        IMPORTER_INGEST_BYTES.observe(ingest_bytes as _);
         IMPORTER_INGEST_DURATION
             .with_label_values(&["ingest"])
             .observe(start.elapsed().as_secs_f64());
-        Ok(meta_info)
+        Ok(())
     }
 
     fn list_ssts(&self) -> Result<Vec<SstMeta>> {
@@ -958,6 +915,7 @@ mod tests {
     use test_sst_importer::*;
 
     use std::f64::INFINITY;
+    use tikv_util::stream::block_on_external_io;
 
     use engine_traits::{
         collect, name_to_cf, EncryptionMethod, Iterable, Iterator, SeekKey, CF_DEFAULT, DATA_CFS,
@@ -1031,7 +989,8 @@ mod tests {
             f.append(&data).unwrap();
             f.finish().unwrap();
 
-            dir.ingest(&meta, &db, key_manager.clone()).unwrap();
+            dir.ingest(&[meta.to_owned()], &db, key_manager.clone())
+                .unwrap();
             check_db_range(&db, range);
 
             ingested.push(meta);
@@ -1174,7 +1133,7 @@ mod tests {
         meta.mut_region_epoch().set_conf_ver(5);
         meta.mut_region_epoch().set_version(6);
 
-        let backend = external_storage::make_local_backend(ext_sst_dir.path());
+        let backend = external_storage_export::make_local_backend(ext_sst_dir.path());
         Ok((ext_sst_dir, backend, meta))
     }
 
@@ -1254,7 +1213,7 @@ mod tests {
         meta.mut_region_epoch().set_conf_ver(5);
         meta.mut_region_epoch().set_version(6);
 
-        let backend = external_storage::make_local_backend(ext_sst_dir.path());
+        let backend = external_storage_export::make_local_backend(ext_sst_dir.path());
         Ok((ext_sst_dir, backend, meta))
     }
 
@@ -1300,7 +1259,7 @@ mod tests {
         meta.mut_region_epoch().set_conf_ver(5);
         meta.mut_region_epoch().set_version(6);
 
-        let backend = external_storage::make_local_backend(ext_sst_dir.path());
+        let backend = external_storage_export::make_local_backend(ext_sst_dir.path());
         Ok((ext_sst_dir, backend, meta))
     }
 
@@ -1337,7 +1296,7 @@ mod tests {
         let mut input = data;
         let mut output = Vec::new();
         let input_len = input.len() as u64;
-        block_on_external_io(SSTImporter::read_external_storage_into_file(
+        block_on_external_io(external_storage_export::read_external_storage_into_file(
             &mut input,
             &mut output,
             &Limiter::new(INFINITY),
@@ -1354,7 +1313,7 @@ mod tests {
 
         let mut input = pending::<io::Result<&[u8]>>().into_async_read();
         let mut output = Vec::new();
-        let err = block_on_external_io(SSTImporter::read_external_storage_into_file(
+        let err = block_on_external_io(external_storage_export::read_external_storage_into_file(
             &mut input,
             &mut output,
             &Limiter::new(INFINITY),
@@ -1597,7 +1556,8 @@ mod tests {
 
             meta.set_length(0); // disable validation.
             meta.set_crc32(0);
-            let resp = importer.ingest(&meta, &db).unwrap();
+            let meta_info = importer.validate(&meta).unwrap();
+            let _ = importer.ingest(&[meta], &db).unwrap();
             // key1 = "zt9102_r01", value1 = "abc", len = 13
             // key2 = "zt9102_r04", value2 = "xyz", len = 13
             // key3 = "zt9102_r07", value3 = "pqrst", len = 15
@@ -1605,8 +1565,8 @@ mod tests {
             // total_bytes = (13 + 13 + 15 + 13) + 4 * 8 = 86
             // don't no why each key has extra 8 byte length in raw_key_size(), but it seems tolerable.
             // https://docs.rs/rocks/0.1.0/rocks/table_properties/struct.TableProperties.html#method.raw_key_size
-            assert_eq!(resp.total_bytes, 86);
-            assert_eq!(resp.total_kvs, 4);
+            assert_eq!(meta_info.total_bytes, 86);
+            assert_eq!(meta_info.total_kvs, 4);
 
             // verifies the DB content is correct.
             let mut iter = db.iterator_cf(cf).unwrap();
@@ -1736,7 +1696,7 @@ mod tests {
         let cfg = Config::default();
         let importer = SSTImporter::new(&cfg, &importer_dir, None).unwrap();
         let sst_writer = create_sst_writer_with_db(&importer, &meta).unwrap();
-        let backend = external_storage::make_local_backend(ext_sst_dir.path());
+        let backend = external_storage_export::make_local_backend(ext_sst_dir.path());
 
         let result = importer.download::<TestEngine>(
             &meta,

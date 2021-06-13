@@ -35,6 +35,7 @@ use engine_rocks::{
 use engine_rocks::{CompactionListener, RocksCompactionJobInfo};
 use engine_rocks::{Compat, RocksEngine, RocksSnapshot};
 use engine_traits::{Engines, Iterable, Peekable};
+use file_system::IORateLimiter;
 use futures::executor::block_on;
 use raftstore::store::fsm::RaftRouter;
 use raftstore::store::*;
@@ -588,6 +589,7 @@ fn dummpy_filter(_: &RocksCompactionJobInfo) -> bool {
 pub fn create_test_engine(
     // TODO: pass it in for all cases.
     router: Option<RaftRouter<RocksEngine, RocksEngine>>,
+    limiter: Option<Arc<IORateLimiter>>,
     cfg: &TiKvConfig,
 ) -> (
     Engines<RocksEngine, RocksEngine>,
@@ -601,7 +603,7 @@ pub fn create_test_engine(
             .map(Arc::new);
 
     let env = get_encrypted_env(key_manager.clone(), None).unwrap();
-    let env = get_inspected_env(Some(env)).unwrap();
+    let env = get_inspected_env(Some(env), limiter).unwrap();
     let cache = cfg.storage.block_cache.build_shared_cache();
 
     let kv_path = dir.path().join(DEFAULT_ROCKSDB_SUB_DIR);
@@ -918,6 +920,18 @@ pub fn kv_pessimistic_lock(
     for_update_ts: u64,
     return_values: bool,
 ) -> PessimisticLockResponse {
+    kv_pessimistic_lock_with_ttl(client, ctx, keys, ts, for_update_ts, return_values, 20)
+}
+
+pub fn kv_pessimistic_lock_with_ttl(
+    client: &TikvClient,
+    ctx: Context,
+    keys: Vec<Vec<u8>>,
+    ts: u64,
+    for_update_ts: u64,
+    return_values: bool,
+    ttl: u64,
+) -> PessimisticLockResponse {
     let mut req = PessimisticLockRequest::default();
     req.set_context(ctx);
     let primary = keys[0].clone();
@@ -932,7 +946,7 @@ pub fn kv_pessimistic_lock(
     req.primary_lock = primary;
     req.start_version = ts;
     req.for_update_ts = for_update_ts;
-    req.lock_ttl = 20;
+    req.lock_ttl = ttl;
     req.is_first_lock = false;
     req.return_values = return_values;
     client.kv_pessimistic_lock(&req).unwrap()
