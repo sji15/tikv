@@ -250,6 +250,11 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
             .map_err(Error::from)
     }
 
+    #[cfg(test)]
+    pub fn get_snapshot(&self) -> E::Snap {
+        self.engine.snapshot(Default::default()).unwrap()
+    }
+
     pub fn release_snapshot(&self) {
         self.engine.release_snapshot();
     }
@@ -691,7 +696,9 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                 let bypass_locks = TsSet::from_u64s(ctx.take_resolved_locks());
 
                 // Update max_ts and check the in-memory lock table before getting the snapshot
-                concurrency_manager.update_max_ts(start_ts);
+                if !ctx.get_stale_read() {
+                    concurrency_manager.update_max_ts(start_ts);
+                }
                 if ctx.get_isolation_level() == IsolationLevel::Si {
                     let begin_instant = Instant::now();
                     concurrency_manager
@@ -1730,7 +1737,9 @@ fn prepare_snap_ctx<'a>(
     cmd: CommandKind,
 ) -> Result<SnapContext<'a>> {
     // Update max_ts and check the in-memory lock table before getting the snapshot
-    concurrency_manager.update_max_ts(start_ts);
+    if !pb_ctx.get_stale_read() {
+        concurrency_manager.update_max_ts(start_ts);
+    }
     fail_point!("before-storage-check-memory-locks");
     let isolation_level = pb_ctx.get_isolation_level();
     if isolation_level == IsolationLevel::Si {
